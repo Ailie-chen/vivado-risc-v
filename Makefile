@@ -14,13 +14,14 @@ include board/$(BOARD)/Makefile.inc
 # --- packages and repos ---
 
 apt-install:
-	sudo apt update
-	sudo apt upgrade
+	#sudo apt update
+	#sudo apt upgrade
 	sudo apt install default-jdk device-tree-compiler python curl gawk \
-	 libtinfo5 libmpc-dev gcc gcc-riscv64-linux-gnu gcc-8-riscv64-linux-gnu flex bison
+	 libtinfo5 libmpc-dev gcc flex bison
+	 #libtinfo5 libmpc-dev gcc gcc-riscv64-linux-gnu gcc-8-riscv64-linux-gnu flex bison
 
 # skip submodules which are not needed and take long time to update
-SKIP_SUBMODULES = torture software/gemmini-rocc-tests software/onnxruntime-riscv
+SKIP_SUBMODULES = torture software/gemmini-rocc-tests software/onnxruntime-riscv #linux-stable
 
 update-submodules:
 	git $(foreach m,$(SKIP_SUBMODULES),-c submodule.$(m).update=none) submodule update --init --force --recursive
@@ -59,7 +60,7 @@ debian-riscv64/rootfs.tar.gz:
 
 linux: linux-stable/arch/riscv/boot/Image
 
-CROSS_COMPILE_LINUX = /usr/bin/riscv64-linux-gnu-
+CROSS_COMPILE_LINUX = /opt/riscv-toolchain/bin/riscv64-unknown-linux-gnu-
 
 linux-patch: patches/linux.patch patches/fpga-axi-sdc.c patches/fpga-axi-eth.c patches/linux.config
 	cd linux-stable && ( git apply -R --check ../patches/linux.patch 2>/dev/null || git apply ../patches/linux.patch )
@@ -69,8 +70,8 @@ linux-patch: patches/linux.patch patches/fpga-axi-sdc.c patches/fpga-axi-eth.c p
 	cp -p patches/linux.config linux-stable/.config
 
 linux-stable/arch/riscv/boot/Image: linux-patch
-	make -C linux-stable ARCH=riscv CROSS_COMPILE=$(CROSS_COMPILE_LINUX) oldconfig
-	make -C linux-stable ARCH=riscv CROSS_COMPILE=$(CROSS_COMPILE_LINUX) all
+	make -C linux-stable ARCH=riscv CROSS_COMPILE=$(CROSS_COMPILE_LINUX) oldconfig -j48
+	make -C linux-stable ARCH=riscv CROSS_COMPILE=$(CROSS_COMPILE_LINUX) all -j48
 
 
 # --- build U-Boot ---
@@ -108,7 +109,7 @@ u-boot/u-boot-nodtb.bin: u-boot-patch $(U_BOOT_SRC)
 	make -C u-boot CROSS_COMPILE=$(CROSS_COMPILE_LINUX) BOARD=vivado_riscv64 vivado_riscv64_config
 	make -C u-boot \
 	  BOARD=vivado_riscv64 \
-	  CC=$(CROSS_COMPILE_LINUX)gcc-8 \
+	  CC=$(CROSS_COMPILE_LINUX)gcc \
 	  CROSS_COMPILE=$(CROSS_COMPILE_LINUX) \
 	  KCFLAGS='-O1 -gno-column-info' \
 	  all
@@ -148,7 +149,8 @@ else ifneq ($(findstring Rocket32,$(CONFIG_SCALA)),)
   CROSS_COMPILE_NO_OS_TOOLS = $(realpath workspace/gcc/riscv/bin)/riscv32-unknown-elf-
   CROSS_COMPILE_NO_OS_FLAGS = -march=rv32imac -mabi=ilp32
 else
-  CROSS_COMPILE_NO_OS_TOOLS = $(realpath workspace/gcc/riscv/bin)/riscv64-unknown-elf-
+  #CROSS_COMPILE_NO_OS_TOOLS = $(realpath workspace/gcc/riscv/bin)/riscv64-unknown-elf-
+  CROSS_COMPILE_NO_OS_TOOLS = /opt/riscv-toolchain/bin/riscv64-unknown-elf-
   CROSS_COMPILE_NO_OS_FLAGS = -march=rv64imac -mabi=lp64
 endif
 
@@ -185,12 +187,14 @@ workspace/$(CONFIG)/system.dts: $(CHISEL_SRC) rocket-chip/bootrom/bootrom.img
 	$(SBT) "runMain freechips.rocketchip.system.Generator -td workspace/$(CONFIG)/tmp -T Vivado.RocketSystem -C Vivado.$(CONFIG_SCALA)"
 	mv workspace/$(CONFIG)/tmp/Vivado.$(CONFIG_SCALA).anno.json workspace/$(CONFIG)/system.anno.json
 	mv workspace/$(CONFIG)/tmp/Vivado.$(CONFIG_SCALA).dts workspace/$(CONFIG)/system.dts
+	cp workspace/$(CONFIG)/system.dts workspace/temp1.dts
 	rm -rf workspace/$(CONFIG)/tmp
 
 # Generate board specific device tree, boot ROM and FIRRTL
-workspace/$(CONFIG)/system-$(BOARD)/Vivado.$(CONFIG_SCALA).fir: workspace/$(CONFIG)/system.dts $(wildcard bootrom/*) workspace/gcc/riscv
+workspace/$(CONFIG)/system-$(BOARD)/Vivado.$(CONFIG_SCALA).fir: workspace/$(CONFIG)/system.dts $(wildcard bootrom/*) #workspace/gcc/riscv
 	mkdir -p workspace/$(CONFIG)/system-$(BOARD)
 	cat workspace/$(CONFIG)/system.dts board/$(BOARD)/bootrom.dts >bootrom/system.dts
+	cp bootrom/system.dts workspace/temp3.dts
 	sed -i "s#reg = <0x80000000 *0x.*>#reg = <$(MEMORY_ADDR_RANGE32)>#g" bootrom/system.dts
 	sed -i "s#reg = <0x0 0x80000000 *0x.*>#reg = <$(MEMORY_ADDR_RANGE)>#g" bootrom/system.dts
 	sed -i "s#clock-frequency = <[0-9]*>#clock-frequency = <$(ROCKET_CLOCK_FREQ)>#g" bootrom/system.dts
@@ -198,6 +202,7 @@ workspace/$(CONFIG)/system-$(BOARD)/Vivado.$(CONFIG_SCALA).fir: workspace/$(CONF
 	sed -i "s#local-mac-address = \[.*\]#local-mac-address = [$(ETHER_MAC)]#g" bootrom/system.dts
 	sed -i "s#phy-mode = \".*\"#phy-mode = \"$(ETHER_PHY)\"#g" bootrom/system.dts
 	sed -i "/interrupts-extended = <&.* 65535>;/d" bootrom/system.dts
+	cp bootrom/system.dts workspace/temp2.dts
 	make -C bootrom CROSS_COMPILE="$(CROSS_COMPILE_NO_OS_TOOLS)" CFLAGS="$(CROSS_COMPILE_NO_OS_FLAGS)" clean bootrom.img
 	mv bootrom/system.dts workspace/$(CONFIG)/system-$(BOARD).dts
 	mv bootrom/bootrom.img workspace/bootrom.img
@@ -226,6 +231,9 @@ workspace/$(CONFIG)/rocket.vhdl: workspace/$(CONFIG)/system-$(BOARD).v
 	  net.largest.riscv.vhdl.Main -m $(CONFIG_SCALA) \
 	  workspace/$(CONFIG)/system-$(BOARD).v >$@
 
+
+vhdl: workspace/$(CONFIG)/rocket.vhdl
+
 # --- utility make targets to run SBT command line ---
 
 .PHONY: sbt rocket-sbt
@@ -252,7 +260,7 @@ vivado    = env XILINX_LOCAL_USER_DATA=no vivado -mode batch -nojournal -nolog -
 
 workspace/$(CONFIG)/system-$(BOARD).tcl: workspace/$(CONFIG)/rocket.vhdl
 	echo "set vivado_board_name $(BOARD)" >$@
-	echo "set vivado_board_part $(BOARD_PART)" >>$@
+	#echo "set vivado_board_part $(BOARD_PART)" >>$@
 	echo "set xilinx_part $(XILINX_PART)" >>$@
 	echo "set rocket_module_name $(CONFIG_SCALA)" >>$@
 	echo "set riscv_clock_frequency $(ROCKET_FREQ_MHZ)" >>$@
@@ -270,7 +278,7 @@ vivado-project: $(proj_time)
 # --- generate FPGA bitstream ---
 
 # Multi-threading appears broken in Vivado. It causes intermittent failures.
-MAX_THREADS ?= 1
+MAX_THREADS ?= 28
 
 $(synthesis): $(proj_time)
 	echo "open_project $(proj_file)" >$(proj_path)/make-synthesis.tcl

@@ -2,7 +2,7 @@
 set list_projs [get_projects -quiet]
 if { $list_projs eq "" } {
    create_project ${vivado_board_name}-riscv vivado-${vivado_board_name}-riscv -part ${xilinx_part}
-   set_property BOARD_PART ${vivado_board_part} [current_project]
+#   set_property BOARD_PART ${vivado_board_part} [current_project]
 }
 
 # Create 'sources_1' fileset (if not found)

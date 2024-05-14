@@ -244,6 +244,11 @@ class Rocket64b2s extends Config(
   new BaseConfig)
 
 /*----------------- Sonic BOOM   ---------------*/
+class Rocket64s1 extends Config(
+    new WithInclusiveCache  ++
+    new WithNBreakpoints(8) ++
+    new boom.common.WithNSmallBooms(1) ++
+    new RocketWideBusConfig)
 
 class Rocket64x1 extends Config(
   new WithInclusiveCache  ++

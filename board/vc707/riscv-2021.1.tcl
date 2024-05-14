@@ -484,8 +484,8 @@ proc create_hier_cell_EthernetVC707 { parentCell nameHier } {
   # Create instance: gig_ethernet_pcs_pma_0, and set properties
   set gig_ethernet_pcs_pma_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:gig_ethernet_pcs_pma:16.2 gig_ethernet_pcs_pma_0 ]
   set_property -dict [ list \
-   CONFIG.DIFFCLK_BOARD_INTERFACE {sgmii_mgt_clk} \
-   CONFIG.ETHERNET_BOARD_INTERFACE {sgmii} \
+   CONFIG.DIFFCLK_BOARD_INTERFACE {Custom} \
+   CONFIG.ETHERNET_BOARD_INTERFACE {Custom} \
    CONFIG.Management_Interface {false} \
    CONFIG.Standard {SGMII} \
    CONFIG.SupportLevel {Include_Shared_Logic_in_Core} \

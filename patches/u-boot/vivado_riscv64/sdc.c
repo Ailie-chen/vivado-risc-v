@@ -123,7 +123,7 @@ static void sdc_set_clock(struct sdc_priv * priv, uint clock) {
     if (clk_div < 1) clk_div = 1;
 
     priv->regs->clock_divider = clk_div - 1;
-    udelay(10000);
+    udelay(1000000);
 }
 
 static int sdc_finish(struct sdc_priv * dev, struct mmc_cmd * cmd) {
@@ -229,7 +229,7 @@ static int sdc_probe(struct udevice * udev) {
     // clear software reset
     priv->regs->software_reset = 0;
     while (priv->regs->software_reset != 0) {}
-    udelay(10000);
+    udelay(1000000);
 
     priv->regs->control = 0;
 

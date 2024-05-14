@@ -710,7 +710,7 @@ proc create_hier_cell_DDR { parentCell nameHier } {
   write_mig_file_riscv_mig_7series_0_0 $str_mig_file_path
 
   set_property -dict [ list \
-   CONFIG.BOARD_MIG_PARAM {ddr3_sdram} \
+   CONFIG.BOARD_MIG_PARAM {Custom} \
    CONFIG.MIG_DONT_TOUCH_PARAM {Custom} \
    CONFIG.RESET_BOARD_INTERFACE {Custom} \
    CONFIG.XML_INPUT_FILE {mig_a.prj} \
