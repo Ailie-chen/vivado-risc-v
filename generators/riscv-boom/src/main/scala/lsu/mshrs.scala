@@ -25,17 +25,17 @@ class BoomDCacheReqInternal(implicit p: Parameters) extends BoomDCacheReq()(p)
 {
   // miss info
   val tag_match = Bool()
-  val old_meta  = new L1Metadata
+  val old_meta  = new L1MetadataBoom
   val way_en    = UInt(nWays.W)
 
   // Used in the MSHRs
   val sdq_id    = UInt(log2Ceil(cfg.nSDQ).W)
+
 }
 
 
 class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
-  with HasL1HellaCacheParameters
-{
+  with HasL1HellaCacheParameters{
   val io = IO(new Bundle {
     val id = Input(UInt())
 
@@ -67,7 +67,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
 
     val refill      = Decoupled(new L1DataWriteReq)
 
-    val meta_write  = Decoupled(new L1MetaWriteReq)
+    val meta_write  = Decoupled(new L1MetaWriteReqBoom)
     val meta_read   = Decoupled(new L1MetaReadReq)
     val meta_resp   = Input(Valid(new L1Metadata))
     val wb_req      = Decoupled(new WritebackReq(edge.bundle))
@@ -75,7 +75,11 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     // To inform the prefetcher when we are commiting the fetch of this line
     val commit_val  = Output(Bool())
     val commit_addr = Output(UInt(coreMaxAddrBits.W))
+    //ailie:
+    val commit_vaddr = Output(UInt(vaddrBitsExtended.W))
     val commit_coh  = Output(new ClientMetadata)
+    //add by ailie
+    val commit_pc_full =if(p(HyperionDefKey)) Some(Output(UInt(vaddrBitsExtended.W))) else None
 
     // Reading from the line buffer
     val lb_read       = Decoupled(new LineBufferReadReq)
@@ -91,8 +95,56 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     val wb_resp     = Input(Bool())
 
     val probe_rdy   = Output(Bool())
+
+    //ailie: add the time field of data miss
+    val time_cycle = Input(UInt(24.W))
+    val prefetch_miss   = Input(Bool())
+    val miss_vaddr      = Input(UInt(vaddrBitsExtended.W))
+    val pc_full = if(p(HyperionDefKey)) Some(Input(UInt(vaddrBitsExtended.W))) else None
   })
 
+  //ailie: time information and addr
+  val miss_time = RegInit(0.U(24.W))
+  when(io.req_pri_val && io.req_pri_rdy){
+    miss_time := io.time_cycle
+    // printf("*******add time*******add time cycle: %d\n", io.time_cycle)
+  } .otherwise{
+    miss_time := miss_time
+  }
+  //ailie:debug for paddr
+  val pbaddr = RegInit(0.U(coreMaxAddrBits.W))
+  when(io.req_pri_val && io.req_pri_rdy){
+    pbaddr := (io.req.addr >> blockOffBits) << blockOffBits
+  } .otherwise{
+    pbaddr := pbaddr
+  }
+  val w_pbaddr = pbaddr
+  //ailie: record miss_latency
+  val miss_latency = RegInit(0.U(12.W))
+  // miss_latency := miss_latency
+  //ailie: record if prefetch
+  val prefetch_miss = RegInit(false.B)
+  when(io.req_pri_val && io.req_pri_rdy){
+    prefetch_miss := io.prefetch_miss
+  }.otherwise{
+    prefetch_miss := prefetch_miss
+  }
+  //ailie:record vaddr
+  val miss_vaddr = RegInit(0.U(vaddrBitsExtended.W))
+  when(io.req_pri_val && io.req_pri_rdy){
+    miss_vaddr := io.miss_vaddr
+  }.otherwise{
+    miss_vaddr := miss_vaddr
+  }
+
+  val pc_full_reg = if(p(HyperionDefKey)) {Some(RegInit(0.U(vaddrBitsExtended.W)))} else None
+  //add by ailie
+  pc_full_reg.map{pc_full=> when(io.req_pri_val && io.req_pri_rdy) {
+      pc_full := io.pc_full.get // 使用 .get 来访问 Some 中的值
+    }.otherwise {
+      pc_full := pc_full // 保持原值
+    }
+  }
   // TODO: Optimize this. We don't want to mess with cache during speculation
   // s_refill_req      : Make a request for a new cache line
   // s_refill_resp     : Store the refill response into our buffer
@@ -113,7 +165,11 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   val req_needs_wb = RegInit(false.B)
 
   val new_coh = RegInit(ClientMetadata.onReset)
+  //ailie:_ records the false or true, shrink param indicates the permission change
+  // and coh_on_clear records the permission after the change
   val (_, shrink_param, coh_on_clear) = req.old_meta.coh.onCacheControl(M_FLUSH)
+  //ailie: acquire the grow param according to the command
+  //ailie: then refresh the new_coh according the grow param
   val grow_param = new_coh.onAccess(req.uop.mem_cmd)._2
   val coh_on_grant = new_coh.onGrant(req.uop.mem_cmd, io.mem_grant.bits.param)
 
@@ -130,7 +186,12 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   rpq.io.flush  := io.exception
   assert(!(state === s_invalid && !rpq.io.empty))
 
+  //initial: prefetch request is not allowed into the replay queue
   rpq.io.enq.valid := ((io.req_pri_val && io.req_pri_rdy) || (io.req_sec_val && io.req_sec_rdy)) && !isPrefetch(io.req.uop.mem_cmd)
+  //ailie: modeified
+  // rpq.io.enq.valid := ((io.req_pri_val && io.req_pri_rdy) || (io.req_sec_val && io.req_sec_rdy))
+
+  
   rpq.io.enq.bits  := io.req
   rpq.io.deq.ready := false.B
 
@@ -163,6 +224,13 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   io.resp.valid          := false.B
   io.commit_val          := false.B
   io.commit_addr         := req.addr
+  //ailie
+  io.commit_vaddr        := miss_vaddr
+
+  //add by ailie
+  io.commit_pc_full.map{commit_pc_full=>
+  commit_pc_full := pc_full_reg.getOrElse(0.U)}
+  
   io.commit_coh          := coh_on_grant
   io.meta_read.valid     := false.B
   io.mem_finish.valid    := false.B
@@ -217,9 +285,10 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
       lgSize          = lgCacheBlockBytes.U,
       growPermissions = grow_param)._2
     when (io.mem_acquire.fire()) {
-      state := s_refill_resp
+      state := s_refill_resp 
     }
   } .elsewhen (state === s_refill_resp) {
+    //ailie: data refill into the line buffer directly
     when (edge.hasData(io.mem_grant.bits)) {
       io.mem_grant.ready      := io.lb_write.ready
       io.lb_write.valid       := io.mem_grant.valid
@@ -234,18 +303,28 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
       grant_had_data := edge.hasData(io.mem_grant.bits)
     }
     when (refill_done) {
+      
       grantack.valid := edge.isRequest(io.mem_grant.bits)
       grantack.bits := edge.GrantAck(io.mem_grant.bits)
       state := Mux(grant_had_data, s_drain_rpq_loads, s_drain_rpq)
       assert(!(!grant_had_data && req_needs_wb))
       commit_line := false.B
       new_coh := coh_on_grant
-
+      //ailie:
+      miss_latency := io.time_cycle - miss_time
+      // printf("*******end time cycle: %d, miss latency is: %d  \n", io.time_cycle,io.time_cycle - miss_time)
     }
   } .elsewhen (state === s_drain_rpq_loads) {
+
+    //initial logic
     val drain_load = (isRead(rpq.io.deq.bits.uop.mem_cmd) &&
                      !isWrite(rpq.io.deq.bits.uop.mem_cmd) &&
                      (rpq.io.deq.bits.uop.mem_cmd =/= M_XLR)) // LR should go through replay
+    //refresh the drain_load logic with is_Prefetch because we regard the Prefetch cmd as Read cmd
+    // val drain_load = ((isRead(rpq.io.deq.bits.uop.mem_cmd)||isPrefetch(rpq.io.deq.bits.uop.mem_cmd)) &&
+    //                  !isWrite(rpq.io.deq.bits.uop.mem_cmd) &&
+    //                  (rpq.io.deq.bits.uop.mem_cmd =/= M_XLR)) // LR should go through replay
+
     // drain all loads for now
     val rp_addr = Cat(req_tag, req_idx, rpq.io.deq.bits.addr(blockOffBits-1,0))
     val word_idx  = if (rowWords == 1) 0.U else rp_addr(log2Up(rowWords*coreDataBytes)-1, log2Up(wordBytes))
@@ -268,11 +347,12 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     when (rpq.io.deq.fire()) {
       commit_line   := true.B
     }
+    //这里prefetch 不加入replay queue,因此这里如果rpq没有提交过指令的话，说明这个请求就是预取的请求
+    //这里存疑，难道预取请求回来的就不能填充meta write了吗
       .elsewhen (rpq.io.empty && !commit_line)
     {
       when (!rpq.io.enq.fire()) {
-        // state := s_mem_finish_1
-        state := s_meta_read
+        state := s_mem_finish_1
         finish_to_prefetch := enablePrefetching.B
       }
     } .elsewhen (rpq.io.empty || (rpq.io.deq.valid && !drain_load)) {
@@ -294,16 +374,17 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   } .elsewhen (state === s_meta_resp_2) {
     val needs_wb = io.meta_resp.bits.coh.onCacheControl(M_FLUSH)._1
     state := Mux(!io.meta_resp.valid, s_meta_read, // Prober could have nack'd this read
+    //ailie:只有当需要写回时，才会去更新这个meta用，meta_write
              Mux(needs_wb, s_meta_clear, s_commit_line))
   } .elsewhen (state === s_meta_clear) {
-    io.meta_write.valid         := true.B
-    io.meta_write.bits.idx      := req_idx
-    io.meta_write.bits.data.coh := coh_on_clear
-    io.meta_write.bits.data.tag := req_tag
-    io.meta_write.bits.way_en   := req.way_en
+    io.meta_write.valid               := true.B
+    io.meta_write.bits.idx            := req_idx
+    io.meta_write.bits.data.coh       := coh_on_clear
+    io.meta_write.bits.data.tag       := req_tag
+    io.meta_write.bits.way_en         := req.way_en
 
     when (io.meta_write.fire()) {
-      state      := s_wb_req
+      state           := s_wb_req
     }
   } .elsewhen (state === s_wb_req) {
     io.wb_req.valid          := true.B
@@ -355,7 +436,13 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     io.meta_write.bits.idx      := req_idx
     io.meta_write.bits.data.coh := new_coh
     io.meta_write.bits.data.tag := req_tag
+    //ailie:
+    io.meta_write.bits.data.lat       := miss_latency
+    io.meta_write.bits.data.prefetch  := prefetch_miss
+    io.meta_write.bits.data.vaddr  := miss_vaddr
+
     io.meta_write.bits.way_en   := req.way_en
+
     when (io.meta_write.fire()) {
       state := s_mem_finish_1
       finish_to_prefetch := false.B
@@ -369,6 +456,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     }
   } .elsewhen (state === s_mem_finish_2) {
     state := Mux(finish_to_prefetch, s_prefetch, s_invalid)
+    miss_latency    := 0.U
   } .elsewhen (state === s_prefetch) {
     io.req_pri_rdy := true.B
     when ((io.req_sec_val && !io.req_sec_rdy) || io.clear_prefetch) {
@@ -390,8 +478,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
 }
 
 class BoomIOMSHR(id: Int)(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
-  with HasL1HellaCacheParameters
-{
+  with HasL1HellaCacheParameters{
   val io = IO(new Bundle {
     val req  = Flipped(Decoupled(new BoomDCacheReq))
     val resp = Decoupled(new BoomDCacheResp)
@@ -500,15 +587,15 @@ class LineBufferMeta(implicit p: Parameters) extends BoomBundle()(p)
 }
 
 class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
-  with HasL1HellaCacheParameters
-{
+  with HasL1HellaCacheParameters{
   val io = IO(new Bundle {
     val req  = Flipped(Vec(memWidth, Decoupled(new BoomDCacheReqInternal))) // Req from s2 of DCache pipe
     val req_is_probe = Input(Vec(memWidth, Bool()))
     val resp = Decoupled(new BoomDCacheResp)
     val secondary_miss = Output(Vec(memWidth, Bool()))
     val block_hit = Output(Vec(memWidth, Bool()))
-
+    val prefetch_miss = Input(Vec(memWidth,Bool()))
+    val miss_vaddrs   = Input(Vec(memWidth, UInt(vaddrBitsExtended.W)))
     val brupdate       = Input(new BrUpdateInfo)
     val exception    = Input(Bool())
     val rob_pnr_idx  = Input(UInt(robAddrSz.W))
@@ -519,7 +606,7 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     val mem_finish   = Decoupled(new TLBundleE(edge.bundle))
 
     val refill     = Decoupled(new L1DataWriteReq)
-    val meta_write = Decoupled(new L1MetaWriteReq)
+    val meta_write = Decoupled(new L1MetaWriteReqBoom)
     val meta_read  = Decoupled(new L1MetaReadReq)
     val meta_resp  = Input(Valid(new L1Metadata))
     val replay     = Decoupled(new BoomDCacheReqInternal)
@@ -536,15 +623,34 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     val probe_rdy = Output(Bool())
   })
 
+  //ailie: lat_cnt 
+  val time_cycle = RegInit(1.U(24.W))
+  time_cycle := time_cycle + 1.U
+  val w_time_cycle = time_cycle
+  val time_start = RegInit(VecInit(Seq.fill(cfg.nMSHRs)(0.U(24.W))))
+  
+
   val req_idx = OHToUInt(io.req.map(_.valid))
   val req     = io.req(req_idx)
   val req_is_probe = io.req_is_probe(0)
+  //add by ailie
+  val prefetch_miss = io.prefetch_miss(req_idx)
+  val miss_vaddr    = io.miss_vaddrs(req_idx)
+  val pc_full = io.req(req_idx).bits.uop.pc_full match {
+    case Some(pc) => Some(pc)  // 提取 pc_full 中的值
+    case None => None              // 如果 pc_full 是 None，就设置为 None
+  }
 
   for (w <- 0 until memWidth)
     io.req(w).ready := false.B
 
-  val prefetcher: DataPrefetcher = if (enablePrefetching) Module(new NLPrefetcher)
-                                                     else Module(new NullPrefetcher)
+  val prefetcher: DataPrefetcher = if (enablePrefetching) {
+        if (p(HyperionDefKey)) Module(new HyperionPrefetcher)
+        else Module(new NLPrefetcher)
+      } else {
+        Module(new NullPrefetcher)
+  }
+
 
   io.prefetch <> prefetcher.io.prefetch
 
@@ -597,7 +703,7 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
 
   val wb_tag_list = Wire(Vec(cfg.nMSHRs, UInt(tagBits.W)))
 
-  val meta_write_arb = Module(new Arbiter(new L1MetaWriteReq           , cfg.nMSHRs))
+  val meta_write_arb = Module(new Arbiter(new L1MetaWriteReqBoom       , cfg.nMSHRs))
   val meta_read_arb  = Module(new Arbiter(new L1MetaReadReq            , cfg.nMSHRs))
   val wb_req_arb     = Module(new Arbiter(new WritebackReq(edge.bundle), cfg.nMSHRs))
   val replay_arb     = Module(new Arbiter(new BoomDCacheReqInternal    , cfg.nMSHRs))
@@ -606,7 +712,10 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
 
   val commit_vals    = Wire(Vec(cfg.nMSHRs, Bool()))
   val commit_addrs   = Wire(Vec(cfg.nMSHRs, UInt(coreMaxAddrBits.W)))
+  //ailie
+  val commit_vaddrs  = Wire(Vec(cfg.nMSHRs, UInt(vaddrBitsExtended.W)))
   val commit_cohs    = Wire(Vec(cfg.nMSHRs, new ClientMetadata))
+  val commit_pc_fulls = if(p(HyperionDefKey)) Some(Wire(Vec(cfg.nMSHRs, UInt(vaddrBitsExtended.W)))) else None
 
   var sec_rdy   = false.B
 
@@ -634,6 +743,22 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     when (i.U === mshr_alloc_idx) {
       pri_rdy := mshr.io.req_pri_rdy
     }
+
+    //ailie: write prefech_miss and vaddr for each MSHR
+    mshr.io.prefetch_miss  := prefetch_miss
+    mshr.io.miss_vaddr    := miss_vaddr
+    // add by ailie
+    mshr.io.pc_full match {
+      case Some(mshr_pc_full) => // 如果 mshr.io.pc_full 存在
+        pc_full match {
+          case Some(pc) => 
+            mshr_pc_full := pc
+          case None =>
+            mshr_pc_full := 0.U
+        }
+      case None =>
+    }
+
 
     mshr.io.req_sec_val  := req.valid && sdq_rdy && tag_match(req_idx) && idx_matches(req_idx)(i) && cacheable
     mshr.io.req          := req.bits
@@ -667,13 +792,30 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
 
     commit_vals(i)  := mshr.io.commit_val
     commit_addrs(i) := mshr.io.commit_addr
+    //ailie
+    commit_vaddrs(i):= mshr.io.commit_vaddr
     commit_cohs(i)  := mshr.io.commit_coh
+    mshr.io.commit_pc_full.map{ commit_pc_full =>
+    commit_pc_fulls.get(i) := commit_pc_full}
+
 
     mshr.io.mem_grant.valid := false.B
     mshr.io.mem_grant.bits  := DontCare
     when (io.mem_grant.bits.source === i.U) {
       mshr.io.mem_grant <> io.mem_grant
     }
+
+    //ailie:compute the fetch latency for each miss
+    //ailie: add clock cnt of mshrs for each mshr
+    mshr.io.time_cycle := time_cycle
+    // val miss_penalty = RegInit(0.U(12.W))
+    // when(mshr.io.mem_finish.ready && mshr.io.mem_finish.valid){
+    //   miss_penalty := time_cycle - mshr.io.miss_start_out
+    //   printf("*******end time*********end time cycle: %d, MSHR is %d,miss latency is: %d  \n", time_cycle, i.U, time_cycle - mshr.io.miss_start_out)
+    // } .otherwise{
+    //   miss_penalty := 0.U
+    // }
+    // mshr.io.miss_latency := miss_penalty
 
     sec_rdy   = sec_rdy || (mshr.io.req_sec_rdy && mshr.io.req_sec_val)
     resp_arb.io.in(i) <> mshr.io.resp
@@ -762,5 +904,14 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
   prefetcher.io.mshr_avail    := RegNext(pri_rdy)
   prefetcher.io.req_val       := RegNext(commit_vals.reduce(_||_))
   prefetcher.io.req_addr      := RegNext(Mux1H(commit_vals, commit_addrs))
+  prefetcher.io.req_vaddr      := RegNext(Mux1H(commit_vals, commit_vaddrs))
   prefetcher.io.req_coh       := RegNext(Mux1H(commit_vals, commit_cohs))
+  //add by ailie
+  commit_pc_fulls.map{commit_pc_fulls=>
+    prefetcher.io.pc_full match{
+      case Some(pref_pc_full) =>
+        pref_pc_full := RegNext(Mux1H(commit_vals, commit_pc_fulls))
+      case None =>
+    }
+  }
 }

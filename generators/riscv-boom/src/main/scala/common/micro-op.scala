@@ -14,7 +14,12 @@ package boom.common
 import chisel3._
 import chisel3.util._
 
-import freechips.rocketchip.config.Parameters
+import freechips.rocketchip.config.{Parameters, Config, Field}
+import freechips.rocketchip.subsystem._
+import freechips.rocketchip.devices.tilelink.{BootROMParams}
+import freechips.rocketchip.diplomacy.{SynchronousCrossing, AsynchronousCrossing, RationalCrossing}
+import freechips.rocketchip.rocket._
+import freechips.rocketchip.tile._
 
 import boom.exu.FUConstants
 
@@ -29,7 +34,7 @@ abstract trait HasBoomUOP extends BoomBundle
 /**
  * MicroOp passing through the pipeline
  */
-class MicroOp(implicit p: Parameters) extends BoomBundle
+class MicroOp(implicit p: Parameters) extends BoomBundle()(p)
   with freechips.rocketchip.rocket.constants.MemoryOpConstants
   with freechips.rocketchip.rocket.constants.ScalarOpConstants
 {
@@ -73,6 +78,9 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   // Aligned to a cache-line size, as that is the greater fetch granularity.
   // TODO: Shouldn't this be aligned to fetch-width size?
   val pc_lob           = UInt(log2Ceil(icBlockBytes).W)
+
+  //add by ailie
+  val pc_full = if (p(HyperionDefKey)) Some(UInt(vaddrBitsExtended.W)) else None
 
   // Was this a branch that was predicted taken?
   val taken            = Bool()

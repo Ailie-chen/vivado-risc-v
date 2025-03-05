@@ -147,7 +147,7 @@ class BoomProbeUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCach
     val req = Flipped(Decoupled(new TLBundleB(edge.bundle)))
     val rep = Decoupled(new TLBundleC(edge.bundle))
     val meta_read = Decoupled(new L1MetaReadReq)
-    val meta_write = Decoupled(new L1MetaWriteReq)
+    val meta_write = Decoupled(new L1MetaWriteReqBoom)
     val wb_req = Decoupled(new WritebackReq(edge.bundle))
     val way_en = Input(UInt(nWays.W))
     val wb_rdy = Input(Bool()) // Is writeback unit currently busy? If so need to retry meta read when its done
@@ -194,6 +194,9 @@ class BoomProbeUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCach
   io.meta_write.bits.idx := req_idx
   io.meta_write.bits.data.tag := req_tag
   io.meta_write.bits.data.coh := new_coh
+  io.meta_write.bits.data.lat := 0.U(12.W)
+  io.meta_write.bits.data.prefetch  := false.B
+  io.meta_write.bits.data.vaddr     := 0.U(vaddrBitsExtended.W)
 
   io.wb_req.valid := state === s_writeback_req
   io.wb_req.bits.source := req.source
@@ -297,6 +300,7 @@ class BoomDuplicatedDataArray(implicit p: Parameters) extends AbstractBoomDataAr
       io.resp(j)(w) := RegNext(array.read(raddr, io.read(j).bits.way_en(w) && io.read(j).valid).asUInt)
     }
     io.nacks(j) := false.B
+    
   }
 }
 
@@ -411,8 +415,12 @@ class BoomDCacheBundle(implicit p: Parameters, edge: TLEdgeOut) extends BoomBund
 
 class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModuleImp(outer)
   with HasL1HellaCacheParameters
-  with HasBoomCoreParameters
-{
+  with HasBoomCoreParameters{
+
+  // ailie: add timing counter
+  // val time_cycle = RegInit(1.U(24.W))
+  // time_cycle := time_cycle + 1.U
+
   implicit val edge = outer.node.edges.out(0)
   val (tl_out, _) = outer.node.out(0)
   val io = IO(new BoomDCacheBundle)
@@ -437,9 +445,9 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   mshrs.io.rob_head_idx := io.lsu.rob_head_idx
 
   // tags
-  def onReset = L1Metadata(0.U, ClientMetadata.onReset)
-  val meta = Seq.fill(memWidth) { Module(new L1MetadataArray(onReset _)) }
-  val metaWriteArb = Module(new Arbiter(new L1MetaWriteReq, 2))
+  def onReset = L1MetadataBoom(0.U, ClientMetadata.onReset,0.U,false.B,0.U)
+  val meta = Seq.fill(memWidth) { Module(new L1MetadataArrayBoom(onReset _)) }
+  val metaWriteArb = Module(new Arbiter(new L1MetaWriteReqBoom, 2))
   // 0 goes to MSHR refills, 1 goes to prober
   val metaReadArb = Module(new Arbiter(new BoomL1MetaReadReq, 6))
   // 0 goes to MSHR replays, 1 goes to prober, 2 goes to wb, 3 goes to MSHR meta read,
@@ -459,6 +467,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   val data = Module(if (boomParams.numDCacheBanks == 1) new BoomDuplicatedDataArray else new BoomBankedDataArray)
   val dataWriteArb = Module(new Arbiter(new L1DataWriteReq, 2))
   // 0 goes to pipeline, 1 goes to MSHR refills
+  // ailie:matawriteArb在命中的情况下，不需要写入mata，所以没有pipeline的输入
   val dataReadArb = Module(new Arbiter(new BoomL1DataReadReq, 3))
   // 0 goes to MSHR replays, 1 goes to wb, 2 goes to pipeline
   dataReadArb.io.in := DontCare
@@ -475,10 +484,16 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
 
   // ------------
   // New requests
-
+  // ailie:lsu无论是读或者写的请求都需要先读出，走“读流水线”
   io.lsu.req.ready := metaReadArb.io.in(4).ready && dataReadArb.io.in(2).ready
   metaReadArb.io.in(4).valid := io.lsu.req.valid
   dataReadArb.io.in(2).valid := io.lsu.req.valid
+  //ailie:在lsu传输信息时，捕获虚拟地址
+  val lsu_vaddrs =  VecInit(Seq.fill(memWidth)(0.U(vaddrBitsExtended.W)))
+  when(io.lsu.req.valid){
+    lsu_vaddrs := io.lsu.lsu_vaddrs
+  }
+
   for (w <- 0 until memWidth) {
     // Tag read for new requests
     metaReadArb.io.in(4).bits.req(w).idx    := io.lsu.req.bits(w).bits.addr >> blockOffBits
@@ -575,16 +590,28 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // Prefetch does not need to read data array
 
-  val s0_valid = Mux(io.lsu.req.fire(), VecInit(io.lsu.req.bits.map(_.valid)),
-                 Mux(mshrs.io.replay.fire() || wb_fire || prober_fire || prefetch_fire || mshrs.io.meta_read.fire(),
+  val s0_valid    = Mux(io.lsu.req.fire(), VecInit(io.lsu.req.bits.map(_.valid)),
+                    Mux(mshrs.io.replay.fire() || wb_fire || prober_fire || prefetch_fire || mshrs.io.meta_read.fire(),
                                         VecInit(1.U(memWidth.W).asBools), VecInit(0.U(memWidth.W).asBools)))
-  val s0_req   = Mux(io.lsu.req.fire()        , VecInit(io.lsu.req.bits.map(_.bits)),
-                 Mux(wb_fire                  , wb_req,
-                 Mux(prober_fire              , prober_req,
-                 Mux(prefetch_fire            , prefetch_req,
-                 Mux(mshrs.io.meta_read.fire(), mshr_read_req
-                                              , replay_req)))))
-  val s0_type  = Mux(io.lsu.req.fire()        , t_lsu,
+  val s0_req      = Mux(io.lsu.req.fire()        , VecInit(io.lsu.req.bits.map(_.bits)),
+                    Mux(wb_fire                  , wb_req,
+                    Mux(prober_fire              , prober_req,
+                    Mux(prefetch_fire            , prefetch_req,
+                    Mux(mshrs.io.meta_read.fire(), mshr_read_req
+                                                  , replay_req)))))
+
+  //ailie: indicate whether current request is prefetch
+  val s0_prefetch   =Mux(io.lsu.req.fire()        , false.B,
+                      Mux(wb_fire                  , false.B,
+                      Mux(prober_fire              , false.B,
+                      Mux(prefetch_fire            , true.B,
+                      Mux(mshrs.io.meta_read.fire(), false.B
+                                                    , false.B)))))
+  //ailie: buffer the lsu_vaddrs
+  val s0_lsu_vaddrs  = lsu_vaddrs
+
+
+  val s0_type       = Mux(io.lsu.req.fire()        , t_lsu,
                  Mux(wb_fire                  , t_wb,
                  Mux(prober_fire              , t_probe,
                  Mux(prefetch_fire            , t_prefetch,
@@ -592,6 +619,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
                                               , t_replay)))))
 
   // Does this request need to send a response or nack
+  //ailie:等于说这里是需要握手的一些信号
   val s0_send_resp_or_nack = Mux(io.lsu.req.fire(), s0_valid,
     VecInit(Mux(mshrs.io.replay.fire() && isRead(mshrs.io.replay.bits.uop.mem_cmd), 1.U(memWidth.W), 0.U(memWidth.W)).asBools))
 
@@ -627,6 +655,11 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
                            wayMap((w: Int) => s1_tag_eq_way(i)(w) && meta(i).io.resp(w).coh.isValid()).asUInt))))
 
   val s1_wb_idx_matches = widthMap(i => (s1_addr(i)(untagBits-1,blockOffBits) === wb.io.idx.bits) && wb.io.idx.valid)
+  //ailie:
+  val s1_prefetch = RegInit(VecInit(Seq.fill(memWidth)(false.B)))
+  s1_prefetch(0) := s0_prefetch
+
+  val s1_lsu_vaddrs = RegNext(s0_lsu_vaddrs)
 
   val s2_req   = RegNext(s1_req)
   val s2_type  = RegNext(s1_type)
@@ -645,12 +678,18 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   val s2_has_permission = widthMap(w => s2_hit_state(w).onAccess(s2_req(w).uop.mem_cmd)._1)
   val s2_new_hit_state  = widthMap(w => s2_hit_state(w).onAccess(s2_req(w).uop.mem_cmd)._3)
 
+  //ailie: why is !mshrs.io.block_hit(w) here? because hit missing data is not correct.
   val s2_hit = widthMap(w => (s2_tag_match(w) && s2_has_permission(w) && s2_hit_state(w) === s2_new_hit_state(w) && !mshrs.io.block_hit(w)) || s2_type.isOneOf(t_replay, t_wb))
   val s2_nack = Wire(Vec(memWidth, Bool()))
   assert(!(s2_type === t_replay && !s2_hit(0)), "Replays should always hit")
   assert(!(s2_type === t_wb && !s2_hit(0)), "Writeback should always see data hit")
 
   val s2_wb_idx_matches = RegNext(s1_wb_idx_matches)
+
+  //ailie:
+  val s2_prefetch = RegNext(s1_prefetch)
+  val s2_lsu_vaddrs = RegNext(s1_lsu_vaddrs)
+
 
   // lr/sc
   val debug_sc_fail_addr = RegInit(0.U)
@@ -760,12 +799,18 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
     mshrs.io.req(w).bits.uop.br_mask := GetNewBrMask(io.lsu.brupdate, s2_req(w).uop)
     mshrs.io.req(w).bits.addr        := s2_req(w).addr
     mshrs.io.req(w).bits.tag_match   := s2_tag_match(w)
-    mshrs.io.req(w).bits.old_meta    := Mux(s2_tag_match(w), L1Metadata(s2_repl_meta(w).tag, s2_hit_state(w)), s2_repl_meta(w))
+    mshrs.io.req(w).bits.old_meta    := Mux(s2_tag_match(w), L1MetadataBoom(s2_repl_meta(w).tag, s2_hit_state(w),s2_repl_meta(w).lat,s2_repl_meta(w).prefetch,s2_repl_meta(w).vaddr), s2_repl_meta(w))
     mshrs.io.req(w).bits.way_en      := Mux(s2_tag_match(w), s2_tag_match_way(w), s2_replaced_way_en)
+    //ailie
+    mshrs.io.prefetch_miss(w)        := s2_prefetch(w)
+    mshrs.io.miss_vaddrs(w)          := s2_lsu_vaddrs(w)
 
     mshrs.io.req(w).bits.data        := s2_req(w).data
     mshrs.io.req(w).bits.is_hella    := s2_req(w).is_hella
     mshrs.io.req_is_probe(w)         := s2_type === t_probe && s2_valid(w)
+
+    //ailie: add miss timestamp
+    // mshrs.io.req(w).bits.latency     := time_cycle
   }
 
   mshrs.io.meta_resp.valid      := !s2_nack_hit(0) || prober.io.mshr_wb_rdy
@@ -793,11 +838,17 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   } .otherwise {
     // This should be GrantData
     mshrs.io.mem_grant <> tl_out.d
+
+    //ailie: grant data refill, computing the data fetch latency
+    //the mem_grant.bits.source表示的是mshr的索引
+    //val fetch_lat = time_cycle - mshr.io.req()
+    
   }
 
   dataWriteArb.io.in(1) <> mshrs.io.refill
   metaWriteArb.io.in(0) <> mshrs.io.meta_write
 
+  // ailie: refill finish
   tl_out.e <> mshrs.io.mem_finish
 
   // writebacks

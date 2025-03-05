@@ -37,7 +37,7 @@ class FetchBufferResp(implicit p: Parameters) extends BoomBundle
  *
  * @param num_entries effectively the number of full-sized fetch packets we can hold.
  */
-class FetchBuffer(implicit p: Parameters) extends BoomModule
+class FetchBuffer(implicit p: Parameters) extends BoomModule()(p)
   with HasBoomCoreParameters
   with HasBoomFrontendParameters
 {
@@ -93,9 +93,14 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
       val i = (b * bankWidth) + w
 
       val pc = (bankAlign(io.enq.bits.pc) + (i << 1).U)
-
+      
       in_uops(i)                := DontCare
       in_mask(i)                := io.enq.valid && io.enq.bits.mask(i)
+      //add by ailie
+      if (p(HyperionDefKey)) {
+        in_uops(i).pc_full.map(_ := pc)
+      }
+      
       in_uops(i).edge_inst      := false.B
       in_uops(i).debug_pc       := pc
       in_uops(i).pc_lob         := pc

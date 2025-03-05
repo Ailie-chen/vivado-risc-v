@@ -334,8 +334,7 @@ class BoomFrontendBundle(val outer: BoomFrontend) extends CoreBundle()(outer.p)
  */
 class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   with HasBoomCoreParameters
-  with HasBoomFrontendParameters
-{
+  with HasBoomFrontendParameters{
   val io = IO(new BoomFrontendBundle(outer))
   val io_reset_vector = outer.resetVectorSinkNode.bundle
   implicit val edge = outer.masterNode.edges.out(0)

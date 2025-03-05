@@ -68,6 +68,7 @@ class BoomDCacheReq(implicit p: Parameters) extends BoomBundle()(p)
   with HasBoomUOP
 {
   val addr  = UInt(coreMaxAddrBits.W)
+
   val data  = Bits(coreDataBits.W)
   val is_hella = Bool() // Is this the hellacache req? If so this is not tracked in LDQ or STQ
 }
@@ -106,6 +107,9 @@ class LSUDMemIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
     val release = Bool()
   })
 
+  //ailie:
+  val lsu_vaddrs = Output(Vec(memWidth, UInt(vaddrBitsExtended.W)))
+
   override def cloneType = new LSUDMemIO().asInstanceOf[this.type]
 }
 
@@ -114,8 +118,10 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val exe = Vec(memWidth, new LSUExeIO)
 
   val dis_uops    = Flipped(Vec(coreWidth, Valid(new MicroOp)))
+
   val dis_ldq_idx = Output(Vec(coreWidth, UInt(ldqAddrSz.W)))
   val dis_stq_idx = Output(Vec(coreWidth, UInt(stqAddrSz.W)))
+
 
   val ldq_full    = Output(Vec(coreWidth, Bool()))
   val stq_full    = Output(Vec(coreWidth, Bool()))
@@ -177,6 +183,7 @@ class LDQEntry(implicit p: Parameters) extends BoomBundle()(p)
     with HasBoomUOP
 {
   val addr                = Valid(UInt(coreMaxAddrBits.W))
+  val vaddr               = UInt(vaddrBitsExtended.W)         
   val addr_is_virtual     = Bool() // Virtual address, we got a TLB miss
   val addr_is_uncacheable = Bool() // Uncacheable, wait until head of ROB to execute
 
@@ -199,6 +206,7 @@ class STQEntry(implicit p: Parameters) extends BoomBundle()(p)
 {
   val addr                = Valid(UInt(coreMaxAddrBits.W))
   val addr_is_virtual     = Bool() // Virtual address, we got a TLB miss
+  val vaddr               = UInt(vaddrBitsExtended.W)
   val data                = Valid(UInt(xLen.W))
 
   val committed           = Bool() // committed by ROB
@@ -249,6 +257,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val hella_req             = Reg(new rocket.HellaCacheReq)
   val hella_data            = Reg(new rocket.HellaCacheWriteData)
   val hella_paddr           = Reg(UInt(paddrBits.W))
+  val hella_vaddr           = Reg(UInt(vaddrBitsExtended.W))
   val hella_xcpt            = Reg(new rocket.HellaCacheExceptions)
 
 
@@ -775,22 +784,29 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   for (w <- 0 until memWidth) {
     dmem_req(w).valid := false.B
     dmem_req(w).bits.uop   := NullMicroOp
+    
     dmem_req(w).bits.addr  := 0.U
     dmem_req(w).bits.data  := 0.U
+    //ailie:
+    io.dmem.lsu_vaddrs(w)   := 0.U
     dmem_req(w).bits.is_hella := false.B
 
     io.dmem.s1_kill(w) := false.B
 
     when (will_fire_load_incoming(w)) {
       dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
+      //ailie:
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
+      io.dmem.lsu_vaddrs(w)   := exe_tlb_vaddr(w)
       dmem_req(w).bits.uop   := exe_tlb_uop(w)
 
       s0_executing_loads(ldq_incoming_idx(w)) := dmem_req_fire(w)
       assert(!ldq_incoming_e(w).bits.executed)
     } .elsewhen (will_fire_load_retry(w)) {
       dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
+      //ailie:
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
+      io.dmem.lsu_vaddrs(w)   := exe_tlb_vaddr(w)
       dmem_req(w).bits.uop   := exe_tlb_uop(w)
 
       s0_executing_loads(ldq_retry_idx) := dmem_req_fire(w)
@@ -798,6 +814,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     } .elsewhen (will_fire_store_commit(w)) {
       dmem_req(w).valid         := true.B
       dmem_req(w).bits.addr     := stq_commit_e.bits.addr.bits
+      //ailie:
+      io.dmem.lsu_vaddrs(w)      := stq_commit_e.bits.vaddr
       dmem_req(w).bits.data     := (new freechips.rocketchip.rocket.StoreGen(
                                     stq_commit_e.bits.uop.mem_size, 0.U,
                                     stq_commit_e.bits.data.bits,
@@ -811,7 +829,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       stq(stq_execute_head).bits.succeeded := false.B
     } .elsewhen (will_fire_load_wakeup(w)) {
       dmem_req(w).valid      := true.B
+      //ailie:
       dmem_req(w).bits.addr  := ldq_wakeup_e.bits.addr.bits
+      io.dmem.lsu_vaddrs(w)   := ldq_wakeup_e.bits.vaddr
       dmem_req(w).bits.uop   := ldq_wakeup_e.bits.uop
 
       s0_executing_loads(ldq_wakeup_idx) := dmem_req_fire(w)
@@ -822,6 +842,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
       dmem_req(w).valid               := !io.hellacache.s1_kill && (!exe_tlb_miss(w) || hella_req.phys)
       dmem_req(w).bits.addr           := exe_tlb_paddr(w)
+      //ailie:
+      io.dmem.lsu_vaddrs(w)            := exe_tlb_vaddr(w)
+      
+
       dmem_req(w).bits.data           := (new freechips.rocketchip.rocket.StoreGen(
         hella_req.size, 0.U,
         io.hellacache.s1_data.data,
@@ -832,12 +856,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       dmem_req(w).bits.is_hella       := true.B
 
       hella_paddr := exe_tlb_paddr(w)
+      //ailie:
+      hella_vaddr := exe_tlb_vaddr(w)
     }
       .elsewhen (will_fire_hella_wakeup(w))
     {
       assert(hella_state === h_replay)
       dmem_req(w).valid               := true.B
       dmem_req(w).bits.addr           := hella_paddr
+      //ailie:
+      io.dmem.lsu_vaddrs(w)            := hella_vaddr
       dmem_req(w).bits.data           := (new freechips.rocketchip.rocket.StoreGen(
         hella_req.size, 0.U,
         hella_data.data,
@@ -855,6 +883,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       val ldq_idx = Mux(will_fire_load_incoming(w), ldq_incoming_idx(w), ldq_retry_idx)
       ldq(ldq_idx).bits.addr.valid          := true.B
       ldq(ldq_idx).bits.addr.bits           := Mux(exe_tlb_miss(w), exe_tlb_vaddr(w), exe_tlb_paddr(w))
+      //ailie:
+      ldq(ldq_idx).bits.vaddr               := exe_tlb_vaddr(w)
+
       ldq(ldq_idx).bits.uop.pdst            := exe_tlb_uop(w).pdst
       ldq(ldq_idx).bits.addr_is_virtual     := exe_tlb_miss(w)
       ldq(ldq_idx).bits.addr_is_uncacheable := exe_tlb_uncacheable(w) && !exe_tlb_miss(w)
@@ -870,6 +901,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
       stq(stq_idx).bits.addr.valid := !pf_st(w) // Prevent AMOs from executing!
       stq(stq_idx).bits.addr.bits  := Mux(exe_tlb_miss(w), exe_tlb_vaddr(w), exe_tlb_paddr(w))
+      //ailie:
+      stq(stq_idx).bits.vaddr      := exe_tlb_vaddr(w)
       stq(stq_idx).bits.uop.pdst   := exe_tlb_uop(w).pdst // Needed for AMOs
       stq(stq_idx).bits.addr_is_virtual := exe_tlb_miss(w)
 
