@@ -91,13 +91,13 @@ val HisTsWidth: Int)(implicit p: Parameters) extends BoomModule {
   val validArray = RegInit(VecInit(Seq.fill(numWays)(VecInit(Seq.fill(numSets)(false.B)))))
   val LruCounters = RegInit(VecInit(Seq.fill(numWays)(VecInit(Seq.fill(numSets)(0.U(log2Ceil(numWays).W))))))
   //初始化
-  when(reset.asBool){
-    for (way <- 0 until numWays) {
-      for (set <- 0 until numSets) {
-        dataArray(way).write(set.U, ((new PCHistoryData()).default).asUInt()) 
-      }
-    }
-  }
+  // when(reset.asBool){
+  //   for (way <- 0 until numWays) {
+  //     for (set <- 0 until numSets) {
+  //       dataArray(way).write(set.U, ((new PCHistoryData()).default).asUInt()) 
+  //     }
+  //   }
+  // }
   // 读写端口
   val readPort = Wire(new PTReadPort(numSets, numWays, HisDataWidth))
   val writePort = Wire(new PTWritePort(numSets, numWays, HisDataWidth))
