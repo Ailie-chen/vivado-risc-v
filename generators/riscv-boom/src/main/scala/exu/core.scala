@@ -63,6 +63,8 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule()
     val ptw_tlb = new freechips.rocketchip.rocket.TLBPTWIO()
     val trace = Output(Vec(coreParams.retireWidth, new ExtendedTracedInstruction))
     val fcsr_rm = UInt(freechips.rocketchip.tile.FPConstants.RM_SZ.W)
+
+    val prefetch_enable = Output(Bool())
   }
   //**********************************
   // construct all of the modules
@@ -374,6 +376,7 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule()
   val pfc_maxPriv     = RegInit(0.U(2.W))
   val pfc_enable      = RegInit(0.U(1.W))
   val sampleHappen    = RegInit(0.U(32.W))
+  val prefetch_enable = RegInit(0.U(1.W))
   val userExitPC      = RegInit(0.U(64.W))
 
   val nowWarmupInsts  = RegInit(0.U(64.W))
@@ -546,6 +549,8 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule()
     event_counters.io.event_signals(w) := 0.U
   }
 
+  io.lsu.prefetch_enable := startCounter
+  // io.prefetch_enable := true.B
   when (startCounter) {
     event_counters.io.event_signals(0) :=   1.U  //cycles
     event_counters.io.event_signals(1) :=  RegNext(PopCount(rob.io.commit.arch_valids.asUInt)) // commit inst
@@ -613,11 +618,22 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule()
     event_counters.io.event_signals(56) :=  PopCount(com_misp_jalrcall.asUInt)  //com misp jalr-call number
 
     event_counters.io.event_signals(57) :=  Mux(io.ptw.perf.l2miss, 1.U, 0.U) //L2 TLB miss
-    event_counters.io.event_signals(58) :=  Mux(misalign_excpt, 1.U, 0.U)  //misalign_excpt
-    event_counters.io.event_signals(59) :=  Mux(lstd_pagefault, 1.U, 0.U)  //lstd_pagefault
-    event_counters.io.event_signals(60) :=  Mux(fetch_pagefault, 1.U, 0.U)  //fetch_pagefault
-    event_counters.io.event_signals(61) :=  Mux(mini_exception, 1.U, 0.U)  //mini_exception
-    event_counters.io.event_signals(62) :=  Mux(rob.io.commit.rollback, 1.U, 0.U)  //rollback_cycles
+    // event_counters.io.event_signals(58) :=  Mux(misalign_excpt, 1.U, 0.U)  //misalign_excpt
+    // event_counters.io.event_signals(59) :=  Mux(lstd_pagefault, 1.U, 0.U)  //lstd_pagefault
+    // event_counters.io.event_signals(60) :=  Mux(fetch_pagefault, 1.U, 0.U)  //fetch_pagefault
+    // event_counters.io.event_signals(61) :=  Mux(mini_exception, 1.U, 0.U)  //mini_exception
+    // event_counters.io.event_signals(62) :=  Mux(rob.io.commit.rollback, 1.U, 0.U)  //rollback_cycles
+
+    
+    //ailie add prefetch:
+    event_counters.io.event_signals(58) :=  PopCount(io.lsu.fire_dmem_hermes)  //misalign_excpt
+    event_counters.io.event_signals(59) :=  PopCount(io.lsu.monitor_result)  //misalign_excpt
+    event_counters.io.event_signals(60) :=  PopCount(io.lsu.Hermes_pd_true)  //fetch_pagefault
+    event_counters.io.event_signals(61) :=  PopCount(io.lsu.access_memory) //mini_exception
+    event_counters.io.event_signals(62) := io.lsu.prefetch_triggered  
+    event_counters.io.event_signals(63) :=  PopCount(io.lsu.hit_prefetch) 
+
+
   }
   
 
@@ -1405,6 +1421,7 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule()
           is (SetUCSR_EventSel)      { sampleEventSel  := rs1_data(2,0) }
           is (SetUCSR_PfcEnable)     { pfc_enable      := rs1_data(0,0) }
           is (SetUCSR_SampleHappen)  { sampleHappen    := rs1_data(31,0) }
+          is (Set_Prefetch)          { prefetch_enable := rs1_data(0,0) }
           is (SetUCSR_WarmupInst)    { 
             warmupInstNum := rs1_data 
             nowWarmupInsts := 0.U 

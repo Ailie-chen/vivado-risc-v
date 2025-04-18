@@ -52,6 +52,7 @@ trait ScalarOpConstants
   val SetUCSR_MaxPriv        = 6.U(12.W)
   val SetUCSR_PfcEnable      = 7.U(12.W)
   val SetUCSR_SampleHappen   = 8.U(12.W)
+  val Set_Prefetch   = 46.U(12.W)
   
   val SetUCSR_Temp1          = 9.U(12.W)
   val SetUCSR_Temp2          = 10.U(12.W)

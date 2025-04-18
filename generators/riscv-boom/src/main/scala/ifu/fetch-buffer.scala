@@ -97,9 +97,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule()(p)
       in_uops(i)                := DontCare
       in_mask(i)                := io.enq.valid && io.enq.bits.mask(i)
       //add by ailie
-      if (p(HyperionDefKey)) {
-        in_uops(i).pc_full.map(_ := pc)
-      }
+      in_uops(i).pc_full        := pc
       
       in_uops(i).edge_inst      := false.B
       in_uops(i).debug_pc       := pc

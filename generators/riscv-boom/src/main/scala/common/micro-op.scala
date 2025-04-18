@@ -80,7 +80,7 @@ class MicroOp(implicit p: Parameters) extends BoomBundle()(p)
   val pc_lob           = UInt(log2Ceil(icBlockBytes).W)
 
   //add by ailie
-  val pc_full = if (p(HyperionDefKey)) Some(UInt(vaddrBitsExtended.W)) else None
+  val pc_full =  UInt(vaddrBitsExtended.W)
 
   // Was this a branch that was predicted taken?
   val taken            = Bool()

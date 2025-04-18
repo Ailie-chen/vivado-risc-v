@@ -55,6 +55,23 @@ import boom.common._
 import boom.exu.{BrUpdateInfo, Exception, FuncUnitResp, CommitSignals, ExeUnitResp}
 import boom.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrMask, WrapInc, IsOlder, UpdateBrMask}
 
+
+class PrefTLBReq(implicit p: Parameters) extends BoomBundle()(p) {
+  val vaddr = UInt((vaddrBits+1).W)
+
+  override def cloneType: this.type = new PrefTLBReq()(p).asInstanceOf[this.type]
+}
+
+class PrefTLBResp(implicit p: Parameters) extends BoomBundle()(p) {
+  val paddr = UInt(coreMaxAddrBits.W)
+  val miss = Bool()
+  val cacheable = Bool()
+  val prefetchable = Bool()
+
+  override def cloneType: this.type = new PrefTLBResp()(p).asInstanceOf[this.type]
+}
+
+
 class LSUExeIO(implicit p: Parameters) extends BoomBundle()(p)
 {
   // The "resp" of the maddrcalc is really a "req" to the LSU
@@ -71,6 +88,7 @@ class BoomDCacheReq(implicit p: Parameters) extends BoomBundle()(p)
 
   val data  = Bits(coreDataBits.W)
   val is_hella = Bool() // Is this the hellacache req? If so this is not tracked in LDQ or STQ
+
 }
 
 class BoomDCacheResp(implicit p: Parameters) extends BoomBundle()(p)
@@ -78,6 +96,9 @@ class BoomDCacheResp(implicit p: Parameters) extends BoomBundle()(p)
 {
   val data = Bits(coreDataBits.W)
   val is_hella = Bool()
+
+  //ailie 
+  val access_memory = Bool()
 }
 
 class LSUDMemIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
@@ -108,9 +129,32 @@ class LSUDMemIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
   })
 
   //ailie:
-  val lsu_vaddrs = Output(Vec(memWidth, UInt(vaddrBitsExtended.W)))
+  val lsu_vaddrs = Output(Vec(memWidth, UInt((vaddrBits+1).W)))
+  val tlb_req = Input(new PrefTLBReq)  // TLB请求
+  val tlb_resp = Output( new PrefTLBResp)  // TLB响应
+  val tlb_valid = Output(Bool())
+  val tlb_req_valid = Input(Bool())
+  val prefetch_enable = Output(Bool())
+  val time_cycle = Input(UInt(64.W))
+
+  //ailie: output prefetch signals
+  val prefetch_triggered = Input(Bool())
+  val hit_prefetch = Input(Vec(memWidth, Bool()))
+  val monitor_result = Input(Bool())
+  val fire_dmem_hermes = Input(Bool())
 
   override def cloneType = new LSUDMemIO().asInstanceOf[this.type]
+
+
+}
+
+class LSUDMemIOHermes(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
+{
+  // In LSU's dmem stage, send the request
+  val req         = Decoupled(new BoomDCacheReq)
+
+
+  override def cloneType = new LSUDMemIOHermes().asInstanceOf[this.type]
 }
 
 class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
@@ -168,6 +212,15 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val dtlb_miss_num     = Output(UInt(4.W))
   val dcache_valid_access  = Output(UInt(4.W))
   val dcache_nack_num      = Output(UInt(4.W))
+  val prefetch_enable      = Input(Bool())
+
+  //ailie: output prefetch signals
+  val prefetch_triggered = Output( Bool())
+  val hit_prefetch = Output(Vec(memWidth, Bool()))
+  val access_memory = Output(Vec(memWidth, Bool()))
+  val Hermes_pd_true = Output(Bool())
+  val monitor_result = Output(Bool())
+  val fire_dmem_hermes = Output(Bool())
 }
 
 class LSUIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
@@ -175,15 +228,17 @@ class LSUIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
   val ptw   = new rocket.TLBPTWIO
   val core  = new LSUCoreIO
   val dmem  = new LSUDMemIO
+  val dmem_hermes = new LSUDMemIOHermes
 
   val hellacache = Flipped(new freechips.rocketchip.rocket.HellaCacheIO)
+
 }
 
 class LDQEntry(implicit p: Parameters) extends BoomBundle()(p)
     with HasBoomUOP
 {
   val addr                = Valid(UInt(coreMaxAddrBits.W))
-  val vaddr               = UInt(vaddrBitsExtended.W)         
+  val vaddr               = UInt((vaddrBits+1).W)         
   val addr_is_virtual     = Bool() // Virtual address, we got a TLB miss
   val addr_is_uncacheable = Bool() // Uncacheable, wait until head of ROB to execute
 
@@ -199,6 +254,9 @@ class LDQEntry(implicit p: Parameters) extends BoomBundle()(p)
   val forward_stq_idx     = UInt(stqAddrSz.W) // Which store did we get the store-load forward from?
 
   val debug_wb_data       = UInt(xLen.W)
+
+  //ailie
+  val predicted_access_memory       = Bool()
 }
 
 class STQEntry(implicit p: Parameters) extends BoomBundle()(p)
@@ -206,7 +264,7 @@ class STQEntry(implicit p: Parameters) extends BoomBundle()(p)
 {
   val addr                = Valid(UInt(coreMaxAddrBits.W))
   val addr_is_virtual     = Bool() // Virtual address, we got a TLB miss
-  val vaddr               = UInt(vaddrBitsExtended.W)
+  val vaddr               = UInt((vaddrBits+1).W)
   val data                = Valid(UInt(xLen.W))
 
   val committed           = Bool() // committed by ROB
@@ -219,6 +277,17 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   with rocket.HasL1HellaCacheParameters
 {
   val io = IO(new LSUIO)
+  for (w <- 0 until memWidth) {
+    io.core.access_memory(w) := io.dmem.resp(w).bits.access_memory && io.dmem.resp(w).valid
+  }
+  io.core.fire_dmem_hermes := io.dmem.fire_dmem_hermes
+  io.core.Hermes_pd_true := false.B
+  io.dmem_hermes.req.valid := false.B
+  io.dmem_hermes.req.bits.addr := 0.U
+  io.dmem_hermes.req.bits.uop := DontCare
+  io.dmem_hermes.req.bits.uop.mem_cmd := 0.U
+  io.core.monitor_result := io.dmem.monitor_result
+
 
 
   val ldq = Reg(Vec(numLdqEntries, Valid(new LDQEntry)))
@@ -233,6 +302,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val stq_commit_head  = Reg(UInt(stqAddrSz.W)) // point to next store to commit
   val stq_execute_head = Reg(UInt(stqAddrSz.W)) // point to next store to execute
 
+  //ailie:
+  val HermesPerceptron = Module(new PrefetchPerceptron)
 
   // If we got a mispredict, the tail will be misaligned for 1 extra cycle
   assert (io.core.brupdate.b2.mispredict ||
@@ -257,13 +328,14 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val hella_req             = Reg(new rocket.HellaCacheReq)
   val hella_data            = Reg(new rocket.HellaCacheWriteData)
   val hella_paddr           = Reg(UInt(paddrBits.W))
-  val hella_vaddr           = Reg(UInt(vaddrBitsExtended.W))
+  val hella_vaddr           = Reg(UInt((vaddrBits+1).W))
   val hella_xcpt            = Reg(new rocket.HellaCacheExceptions)
 
 
   val dtlb = Module(new NBDTLB(
     instruction = false, lgMaxSize = log2Ceil(coreDataBytes), rocket.TLBConfig(dcacheParams.nTLBSets, dcacheParams.nTLBWays)))
 
+  dtlb.io.actual_prefetch := false.B
   io.ptw <> dtlb.io.ptw
   io.core.perf.tlbMiss := io.ptw.req.fire()
   io.core.perf.acquire := io.dmem.perf.acquire
@@ -322,6 +394,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     stq_full = WrapInc(st_enq_idx, numStqEntries) === stq_head
     io.core.stq_full(w)    := stq_full
     io.core.dis_stq_idx(w) := st_enq_idx
+
+
 
     val dis_ld_val = io.core.dis_uops(w).valid && io.core.dis_uops(w).bits.uses_ldq && !io.core.dis_uops(w).bits.exception
     val dis_st_val = io.core.dis_uops(w).valid && io.core.dis_uops(w).bits.uses_stq && !io.core.dis_uops(w).bits.exception
@@ -405,6 +479,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val will_fire_sta_retry      = Wire(Vec(memWidth, Bool()))
   val will_fire_store_commit   = Wire(Vec(memWidth, Bool()))
   val will_fire_load_wakeup    = Wire(Vec(memWidth, Bool()))
+  val will_fire_prefetch_incoming = Wire(Vec(memWidth, Bool()))
 
   val exe_req = WireInit(VecInit(io.core.exe.map(_.req)))
   // Sfence goes through all pipes
@@ -465,6 +540,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // Can we fire a incoming load
   val can_fire_load_incoming = widthMap(w => exe_req(w).valid && exe_req(w).bits.uop.ctrl.is_load)
 
+  val can_fire_prefetch_incoming = widthMap(w => (!(exe_req.map(_.valid).reduce(_ || _))) && io.dmem.tlb_req_valid)
   // Can we fire an incoming store addrgen + store datagen
   val can_fire_stad_incoming = widthMap(w => exe_req(w).valid && exe_req(w).bits.uop.ctrl.is_sta
                                                               && exe_req(w).bits.uop.ctrl.is_std)
@@ -485,6 +561,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val can_fire_release       = widthMap(w => (w == memWidth-1).B && io.dmem.release.valid)
   io.dmem.release.ready     := will_fire_release.reduce(_||_)
 
+  io.core.prefetch_triggered := io.dmem.prefetch_triggered
+  io.core.hit_prefetch := io.dmem.hit_prefetch
   // Can we retry a load that missed in the TLB
   val can_fire_load_retry    = widthMap(w =>
                                ( ldq_retry_e.valid                            &&
@@ -548,6 +626,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   //---------------------------------------------------------
   // Controller logic. Arbitrate which request actually fires
 
+  
   val exe_tlb_valid = Wire(Vec(memWidth, Bool()))
   for (w <- 0 until memWidth) {
     var tlb_avail  = true.B
@@ -587,7 +666,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     will_fire_sta_retry     (w) := lsu_sched(can_fire_sta_retry     (w) , true , false, true , true)  // TLB ,    , LCAM , ROB // TODO: This should be higher priority
     will_fire_load_wakeup   (w) := lsu_sched(can_fire_load_wakeup   (w) , false, true , true , false) //     , DC , LCAM1
     will_fire_store_commit  (w) := lsu_sched(can_fire_store_commit  (w) , false, true , false, false) //     , DC
-
+    will_fire_prefetch_incoming      (w) := lsu_sched(can_fire_prefetch_incoming  (w) , true , false , false, false) // TLB , DC
 
     assert(!(exe_req(w).valid && !(will_fire_load_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_incoming(w) || will_fire_std_incoming(w) || will_fire_sfence(w))))
 
@@ -618,6 +697,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   assert(!(hella_state =/= h_ready && hella_req.cmd === rocket.M_SFENCE),
     "SFENCE through hella interface not supported")
 
+  val PrefUop = NullMicroOp
+  PrefUop.mem_cmd := 2.U(5.W)  // 预取读请求
+  PrefUop.mem_size := log2Ceil(cacheBlockBytes).U
+  PrefUop.mem_signed := false.B
+
   val exe_tlb_uop = widthMap(w =>
                     Mux(will_fire_load_incoming (w) ||
                         will_fire_stad_incoming (w) ||
@@ -626,17 +710,19 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                     Mux(will_fire_load_retry    (w)  , ldq_retry_e.bits.uop,
                     Mux(will_fire_sta_retry     (w)  , stq_retry_e.bits.uop,
                     Mux(will_fire_hella_incoming(w)  , NullMicroOp,
-                                                       NullMicroOp)))))
+                    Mux(will_fire_prefetch_incoming(w),        PrefUop, 
+                                                       NullMicroOp))))))
 
   val exe_tlb_vaddr = widthMap(w =>
                     Mux(will_fire_load_incoming (w) ||
                         will_fire_stad_incoming (w) ||
-                        will_fire_sta_incoming  (w)  , exe_req(w).bits.addr,
+                        will_fire_sta_incoming  (w)  , exe_req(w).bits.addr,      
                     Mux(will_fire_sfence        (w)  , exe_req(w).bits.sfence.bits.addr,
                     Mux(will_fire_load_retry    (w)  , ldq_retry_e.bits.addr.bits,
                     Mux(will_fire_sta_retry     (w)  , stq_retry_e.bits.addr.bits,
                     Mux(will_fire_hella_incoming(w)  , hella_req.addr,
-                                                       0.U))))))
+                    Mux(will_fire_prefetch_incoming(w)        , io.dmem.tlb_req.vaddr,  
+                                                       0.U)))))))
 
   val exe_sfence = WireInit((0.U).asTypeOf(Valid(new rocket.SFenceReq)))
   for (w <- 0 until memWidth) {
@@ -651,6 +737,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                        will_fire_sta_incoming  (w) ||
                        will_fire_sfence        (w) ||
                        will_fire_load_retry    (w) ||
+                       will_fire_prefetch_incoming (w) ||
                        will_fire_sta_retry     (w)  , exe_tlb_uop(w).mem_size,
                    Mux(will_fire_hella_incoming(w)  , hella_req.size,
                                                       0.U)))
@@ -662,11 +749,13 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                        will_fire_load_retry    (w) ||
                        will_fire_sta_retry     (w)  , exe_tlb_uop(w).mem_cmd,
                    Mux(will_fire_hella_incoming(w)  , hella_req.cmd,
-                                                      0.U)))
+                   Mux(will_fire_prefetch_incoming(w) , 2.U(5.W),
+                                                      0.U))))
 
   val exe_passthr= widthMap(w =>
+                   Mux(will_fire_prefetch_incoming(w)   , false.B,   
                    Mux(will_fire_hella_incoming(w)  , hella_req.phys,
-                                                      false.B))
+                                                      false.B)))
   val exe_kill   = widthMap(w =>
                    Mux(will_fire_hella_incoming(w)  , io.hellacache.s1_kill,
                                                       false.B))
@@ -687,6 +776,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val pf_st = widthMap(w => dtlb.io.req(w).valid && dtlb.io.resp(w).pf.st && exe_tlb_uop(w).uses_stq)
   val ae_ld = widthMap(w => dtlb.io.req(w).valid && dtlb.io.resp(w).ae.ld && exe_tlb_uop(w).uses_ldq)
   val ae_st = widthMap(w => dtlb.io.req(w).valid && dtlb.io.resp(w).ae.st && exe_tlb_uop(w).uses_stq)
+
 
   // TODO check for xcpt_if and verify that never happens on non-speculative instructions.
   val mem_xcpt_valids = RegNext(widthMap(w =>
@@ -734,6 +824,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val exe_tlb_paddr = widthMap(w => Cat(dtlb.io.resp(w).paddr(paddrBits-1,corePgIdxBits),
                                         exe_tlb_vaddr(w)(corePgIdxBits-1,0)))
   val exe_tlb_uncacheable = widthMap(w => !(dtlb.io.resp(w).cacheable))
+  val exe_tlb_prefetchable = widthMap(w => dtlb.io.resp(w).prefetchable)
 
   for (w <- 0 until memWidth) {
     assert (exe_tlb_paddr(w) === dtlb.io.resp(w).paddr || exe_req(w).bits.sfence.valid, "[lsu] paddrs should match.")
@@ -754,7 +845,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       }
     }
   }
-
+  
 
 
   //------------------------------
@@ -777,10 +868,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val dmem_req_fire = widthMap(w => dmem_req(w).valid && io.dmem.req.fire())
   //Enable_PerfCounter_Support: for lsu information
   io.core.dcache_valid_access     := PopCount(dmem_req_fire.asUInt)
+  //ailie:
+  io.dmem.prefetch_enable := io.core.prefetch_enable
 
   val s0_executing_loads = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B)))
 
-
+  io.dmem.tlb_valid := false.B
   for (w <- 0 until memWidth) {
     dmem_req(w).valid := false.B
     dmem_req(w).bits.uop   := NullMicroOp
@@ -794,6 +887,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     io.dmem.s1_kill(w) := false.B
 
     when (will_fire_load_incoming(w)) {
+      
       dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
       //ailie:
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
@@ -802,7 +896,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
       s0_executing_loads(ldq_incoming_idx(w)) := dmem_req_fire(w)
       assert(!ldq_incoming_e(w).bits.executed)
-    } .elsewhen (will_fire_load_retry(w)) {
+    } .elsewhen (will_fire_prefetch_incoming(0)) {
+      dmem_req(w).valid := false.B
+      dtlb.io.actual_prefetch := true.B
+      io.dmem.tlb_valid := dtlb.io.req(0).ready
+      io.dmem.tlb_resp.miss := exe_tlb_miss(0) || exe_tlb_uncacheable(0)
+      io.dmem.tlb_resp.paddr := exe_tlb_paddr(0)
+      io.dmem.tlb_resp.cacheable := (!exe_tlb_uncacheable(0) || dtlb.io.pf_prefetch(0)|| dtlb.io.ma_prefetch(0) || dtlb.io.ae_prefetch(0))
+      io.dmem.tlb_resp.prefetchable := exe_tlb_prefetchable(0)
+    }.elsewhen (will_fire_load_retry(w)) {
       dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
       //ailie:
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
@@ -890,8 +992,24 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(ldq_idx).bits.addr_is_virtual     := exe_tlb_miss(w)
       ldq(ldq_idx).bits.addr_is_uncacheable := exe_tlb_uncacheable(w) && !exe_tlb_miss(w)
 
+
+      //ailie: it's time to predict whether this load will access memory using a perceptron
+      HermesPerceptron.io.r_vaddr := ldq(ldq_idx).bits.vaddr
+      HermesPerceptron.io.r_pc_full := ldq(ldq_idx).bits.uop.pc_full
+      ldq(ldq_idx).bits.predicted_access_memory := HermesPerceptron.io.predicted_access_memory
+      io.core.Hermes_pd_true := HermesPerceptron.io.predicted_access_memory
+      when(!exe_tlb_miss(0) && !exe_tlb_uncacheable(0) && io.dmem_hermes.req.ready && HermesPerceptron.io.predicted_access_memory){
+        io.dmem_hermes.req.valid := true.B
+        io.dmem_hermes.req.bits.addr := exe_tlb_paddr(0)
+        io.dmem_hermes.req.bits.uop := exe_tlb_uop(0)
+        io.dmem_hermes.req.bits.uop.mem_cmd := 2.U(5.W) 
+      }
+
       assert(!(will_fire_load_incoming(w) && ldq_incoming_e(w).bits.addr.valid),
         "[lsu] Incoming load is overwriting a valid address")
+    }.otherwise{
+      HermesPerceptron.io.r_vaddr := 0.U
+      HermesPerceptron.io.r_pc_full := 0.U
     }
 
     when (will_fire_sta_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_retry(w))
@@ -1352,11 +1470,26 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         }
       }
     }
+
+    //ailie    
+    HermesPerceptron.io.w_pc_full := 0.U
+    HermesPerceptron.io.w_vaddr := 0.U
+    // Handle the response
+    HermesPerceptron.io.actual_access_memory := false.B
+    HermesPerceptron.io.wpredicted_access_memory := false.B
+    HermesPerceptron.io.start_training := false.B
     // Handle the response
     when (io.dmem.resp(w).valid)
     {
       when (io.dmem.resp(w).bits.uop.uses_ldq)
       {
+        //ailie: obtain training information from the cache hit response
+        HermesPerceptron.io.start_training := true.B
+        HermesPerceptron.io.w_vaddr := ldq(io.dmem.resp(w).bits.uop.ldq_idx).bits.vaddr
+        HermesPerceptron.io.w_pc_full := ldq(io.dmem.resp(w).bits.uop.ldq_idx).bits.uop.pc_full
+        HermesPerceptron.io.wpredicted_access_memory := ldq(io.dmem.resp(w).bits.uop.ldq_idx).bits.predicted_access_memory
+        HermesPerceptron.io.actual_access_memory := io.dmem.resp(w).bits.access_memory
+
         assert(!io.dmem.resp(w).bits.is_hella)
         val ldq_idx = io.dmem.resp(w).bits.uop.ldq_idx
         val send_iresp = ldq(ldq_idx).bits.uop.dst_rtype === RT_FIX
@@ -1765,4 +1898,64 @@ class ForwardingAgeLogic(num_entries: Int)(implicit p: Parameters) extends BoomM
    }
 
    io.forwarding_val := found_match
+}
+
+
+class PrefetchPerceptron(implicit p: Parameters) extends BoomModule()(p){
+  val io = IO(new Bundle{
+    val r_vaddr = Input(UInt(vaddrBits.W))
+    val r_pc_full = Input(UInt(vaddrBits.W)) 
+    val predicted_access_memory = Output(Bool())
+
+    val start_training = Input(Bool())
+    val w_vaddr = Input(UInt(vaddrBits.W))
+    val w_pc_full = Input(UInt(vaddrBits.W))
+    val wpredicted_access_memory = Input(Bool())
+    val actual_access_memory = Input(Bool())
+  })
+
+  // impelmentation a perceptron to predict whether a load will access memory
+  val threshold = ((1.U << (p(HermesCfg).WWidth -1)) - 2.U) * (p(HermesCfg).featuresNum).U
+  val weights = RegInit(VecInit(Seq.fill(p(HermesCfg).featuresNum)(VecInit(Seq.fill(1 << (p(HermesCfg).FWidth))((1 << (p(HermesCfg).WWidth -1)).U((p(HermesCfg).WWidth).W))))))
+  // val weights = VecInit(Seq.fill(p(HermesCfg).featuresNum)(VecInit(Seq.fill(1 << (p(HermesCfg).FWidth))(0.U((p(HermesCfg).FWidth).W)))))
+  //初始化：所有权重为(1.U << (p(HermesCfg).WWidth -1))
+  // for (i <- 0 until p(HermesCfg).featuresNum){
+  //   for (j <- 0 until (1 << (p(HermesCfg).FWidth))){ 
+  //     weights(i)(j) := (1 << (p(HermesCfg).WWidth -1)).U
+  //   }
+  // }
+
+  val rfeatures = VecInit(Seq.fill(p(HermesCfg).featuresNum)(0.U((p(HermesCfg).FWidth).W)))
+  rfeatures(0) := hash_pc(io.r_pc_full)
+  rfeatures(1) := hash_pc(io.r_vaddr)
+  val bias = 0.U((p(HermesCfg).BiasWidth).W)
+  //ailie: 根据权重和偏置计算预测值=weights(0)(features(0)) + weights(1)(features(1)) + bias，
+  val rpredicted_access_memory = Wire(UInt((p(HermesCfg).WWidth + log2Ceil(p(HermesCfg).featuresNum) + 2).W))
+  rpredicted_access_memory := weights(0)(rfeatures(0)) + weights(1)(rfeatures(1)) + bias
+  io.predicted_access_memory := rpredicted_access_memory > threshold
+
+  
+  val wfeatures = VecInit(Seq.fill(p(HermesCfg).featuresNum)(0.U((p(HermesCfg).FWidth).W)))
+  val WeightMax = (1.U << (p(HermesCfg).WWidth).U) - 1.U
+  val WeightMin = 0.U
+  wfeatures(0) := hash_pc(io.w_pc_full)
+  wfeatures(1) := hash_pc(io.w_vaddr)
+  when(io.start_training){
+    when( io.actual_access_memory){
+      weights(0)(wfeatures(0)) := Mux(weights(0)(wfeatures(0)) <= WeightMax, weights(0)(wfeatures(0)) + 1.U, weights(0)(wfeatures(0)))
+      weights(1)(wfeatures(1)) := Mux(weights(1)(wfeatures(1)) <= WeightMax, weights(1)(wfeatures(1)) + 1.U, weights(1)(wfeatures(1)))
+    } .elsewhen (!io.actual_access_memory){
+      weights(0)(wfeatures(0)) := Mux(weights(0)(wfeatures(0)) >= WeightMin, weights(0)(wfeatures(0)) - 1.U, weights(0)(wfeatures(0)))
+      weights(1)(wfeatures(1)) := Mux(weights(1)(wfeatures(1)) >= WeightMin, weights(1)(wfeatures(1)) - 1.U, weights(1)(wfeatures(1)))
+    }
+  }
+
+
+  def hash_pc(pc: UInt)(implicit p: Parameters): UInt = {
+    ((pc >> 1) ^ (pc >> 4))&((1.U << (p(HermesCfg).FWidth).U) - 1.U)
+  }
+  def hash_vaddr(vaddr: UInt)(implicit p: Parameters): UInt = {
+    ((vaddr >> 12.U))&((1.U << (p(HermesCfg).FWidth).U) - 1.U)
+  }
+
 }

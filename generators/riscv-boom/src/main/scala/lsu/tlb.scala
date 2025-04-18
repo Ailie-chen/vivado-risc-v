@@ -23,6 +23,13 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     val sfence = Input(Valid(new SFenceReq))
     val ptw = new TLBPTWIO
     val kill = Input(Bool())
+    val actual_prefetch = Input(Bool())
+
+    //ailie
+    val ae_prefetch = Output(Vec(memWidth, Bool()))
+    val ma_prefetch = Output(Vec(memWidth, Bool()))
+    val pf_prefetch = Output(Vec(memWidth, Bool()))
+
   })
 
   class EntryData extends Bundle {
@@ -246,6 +253,8 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   val cmd_write          = widthMap(w => isWrite(io.req(w).bits.cmd))
   val cmd_write_perms    = widthMap(w => cmd_write(w) ||
     coreParams.haveCFlush.B && io.req(w).bits.cmd === M_FLUSH_ALL) // not a write, but needs write permissions
+  //ailie
+  val cmd_prefetch = widthMap(w => isPrefetch(io.req(w).bits.cmd))
 
   val lrscAllowed = widthMap(w => Mux((usingDataScratchpad || usingAtomicsOnlyForIO).B, 0.U, c_array(w)))
   val ae_array = widthMap(w =>
@@ -264,7 +273,12 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   val ma_st_array = widthMap(w => Mux(misaligned(w) && cmd_write(w), ~eff_array(w), 0.U))
   val pf_ld_array = widthMap(w => Mux(cmd_read(w)       , ~(r_array(w) | ptw_ae_array(w)), 0.U))
   val pf_st_array = widthMap(w => Mux(cmd_write_perms(w), ~(w_array(w) | ptw_ae_array(w)), 0.U))
-  val pf_inst_array = widthMap(w => ~(x_array(w) | ptw_ae_array(w)))
+  val pf_inst_array = widthMap(w => Mux(misaligned(w) && cmd_read(w) , ~eff_array(w), 0.U))
+
+  val ae_prefetch_array = widthMap(w => Mux(cmd_prefetch(w) ,ae_array(w) | ~pr_array(w), 0.U))
+  val ma_prefetch_array = widthMap(w =>   Mux(misaligned(w) && cmd_prefetch(w) , ~eff_array(w), 0.U))
+  val pf_prefetch_array = widthMap(w =>  Mux(cmd_prefetch(w)  , ~(r_array(w) | ptw_ae_array(w)), 0.U))
+  
 
   val tlb_hit = widthMap(w => real_hits(w).orR)
   val tlb_miss = widthMap(w => vm_enabled(w) && !bad_va(w) && !tlb_hit(w))
@@ -302,6 +316,9 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     io.resp(w).prefetchable := (prefetchable_array(w) & hits(w)).orR && edge.manager.managers.forall(m => !m.supportsAcquireB || m.supportsHint).B
     io.resp(w).miss  := do_refill || tlb_miss(w) || multipleHits(w)
     io.resp(w).paddr := Cat(ppn(w), io.req(w).bits.vaddr(pgIdxBits-1, 0))
+    io.pf_prefetch(w) := (bad_va(w) && cmd_prefetch(w)) || (pf_prefetch_array(w) & hits(w)).orR
+    io.ma_prefetch(w) := (ma_prefetch_array(w) & hits(w)).orR
+    io.ae_prefetch(w) := (ae_prefetch_array(w) & hits(w)).orR
   }
 
   io.ptw.req.valid := state === s_request
@@ -311,7 +328,7 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   if (usingVM) {
     val sfence = io.sfence.valid
     for (w <- 0 until memWidth) {
-      when (io.req(w).fire() && tlb_miss(w) && state === s_ready) {
+      when (io.req(w).fire() && tlb_miss(w) && state === s_ready && (!io.actual_prefetch)) {
         state := s_request
         r_refill_tag := vpn(w)
 

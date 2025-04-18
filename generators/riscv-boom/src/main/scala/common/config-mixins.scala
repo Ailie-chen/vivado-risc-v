@@ -50,6 +50,8 @@ class PrefDelTableConfig(
   val DelNum: Int,
   val DelWidth: Int,
   val DelLcWidth: Int,
+  val PCConfMax: Int,
+  val PageConfMax: Int,
   override val numSets: Int = 8,
   override val numWays: Int = 6,
   override val tagWidth: Int = 12
@@ -58,15 +60,37 @@ class PrefDelTableConfig(
   numWays = numWays,            
   tagWidth = tagWidth  
 ) {
-  val HisDataWidth = DelTcWidth + DelNum * (DelWidth + DelLcWidth)
+  val DelDataWidth = DelTcWidth + DelNum * (DelWidth + DelLcWidth)
 }
 
+class CacheLatConfig(
+  val LatWidth: Int,
+  val TsCntWidth: Int,
+  val PrefThresh: Int // the value has been multiplied by 256
+){}
 
+class PrefQConfig(
+  val CmdNum        : Int,
+  val PrefNum       : Int,
+  val DeltasRegNum  : Int
+){}
+
+class HermesConfig (
+  val featuresNum: Int,
+  val FWidth: Int,
+  val WWidth: Int,
+  val BiasWidth: Int  
+){}
+
+case object HermesCfg extends Field[HermesConfig]
 
 case object HyperionDefKey extends Field[Boolean]
 case object PCPrefHisCfg extends Field[PrefHisTableConfig]
 case object PagePrefHisCfg extends Field[PrefHisTableConfig]
 case object PrefDelCfg extends Field[PrefDelTableConfig]
+case object L1DPrefCfg extends Field[CacheLatConfig]
+case object QCfg extends Field[PrefQConfig]
+
 // ---------------------
 // BOOM Config Fragments
 // ---------------------
@@ -148,15 +172,40 @@ class WithNSmallBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends 
       HisTsWidth = 16       
     )
     case PagePrefHisCfg => new PrefHisTableConfig(      
-      HisNum = 10,          
-      HisAdrWidth = 16,   
+      HisNum = 8,          
+      HisAdrWidth = 24,   
       HisTsWidth = 16     
     )
-    case PrefDelCfg => new PrefDelTableConfig(             
-      DelTcWidth = 18,     
-      DelNum = 10,         
-      DelWidth = 12,     
-      DelLcWidth = 12      
+    case PrefDelCfg => new PrefDelTableConfig(
+      numSets = 2,
+      numWays = 4,
+      tagWidth = 10,             
+      DelTcWidth = 4,     
+      DelNum = 4,         
+      DelWidth = 13,     
+      DelLcWidth = 4,
+      PCConfMax = 15,
+      PageConfMax = 15    
+    )
+
+    case L1DPrefCfg => new CacheLatConfig(             
+      LatWidth = 12,
+      TsCntWidth = 24,
+      PrefThresh = 153
+    )
+
+    case QCfg => new PrefQConfig(
+
+      CmdNum = 12,
+      PrefNum = 12,
+      DeltasRegNum = 3
+    )
+
+    case HermesCfg => new HermesConfig(
+      featuresNum = 2,
+      FWidth = 4,
+      WWidth = 5,
+      BiasWidth = 5
     )
 
     case TilesLocated(InSubsystem) => {
@@ -213,24 +262,47 @@ class WithNMediumBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends
     //add by ailie: cfg of tables in Hypeiron
     case PCPrefHisCfg => new PrefHisTableConfig( 
       numSets = 2,
-      numWays = 16,
+      numWays = 2,
       tagWidth = 10,
-      HisNum = 8,            
+      HisNum = 2,            
       HisAdrWidth = 24,   
       HisTsWidth = 16       
     )
     case PagePrefHisCfg => new PrefHisTableConfig(      
-      HisNum = 10,          
-      HisAdrWidth = 16,   
+      HisNum = 8,          
+      HisAdrWidth = 24,   
       HisTsWidth = 16     
     )
-    case PrefDelCfg => new PrefDelTableConfig(             
-      DelTcWidth = 18,     
-      DelNum = 10,         
-      DelWidth = 12,     
-      DelLcWidth = 12      
+    case PrefDelCfg => new PrefDelTableConfig(
+      numSets = 2,
+      numWays = 2,
+      tagWidth = 10,             
+      DelTcWidth = 4,     
+      DelNum = 2,         
+      DelWidth = 13,     
+      DelLcWidth = 4,
+      PCConfMax = 15,
+      PageConfMax = 15    
     )
 
+    case L1DPrefCfg => new CacheLatConfig(             
+      LatWidth = 12,
+      TsCntWidth = 24,
+      PrefThresh = 153
+    )
+
+    case QCfg => new PrefQConfig(
+
+      CmdNum = 12,
+      PrefNum = 12,
+      DeltasRegNum = 2
+    )
+    case HermesCfg => new HermesConfig(
+      featuresNum = 2,
+      FWidth = 4,
+      WWidth = 5,
+      BiasWidth = 5
+    )
     case TilesLocated(InSubsystem) => {
       val prev = up(TilesLocated(InSubsystem), site)
       val idOffset = overrideIdOffset.getOrElse(prev.size)
@@ -251,9 +323,9 @@ class WithNMediumBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends
               numStqEntries = 16,
               maxBrCount = 12,
               numFetchBufferEntries = 16,
+              enablePrefetching = true,
               ftq = FtqParameters(nEntries=32),
               nPerfCounters = 6,
-              enablePrefetching = true,
               fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true))
             ),
             dcache = Some(
